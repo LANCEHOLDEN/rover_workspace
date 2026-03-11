@@ -1,0 +1,39 @@
+# ROS 2 build artifacts
+build/
+install/
+log/
+
+# ROS bag files (large binary data)
+src/bag_files/
+*.db3
+*.bag
+*.mcap
+
+# Python
+*.pyc
+*.pyo
+__pycache__/
+*.egg-info/
+.eggs/
+dist/
+*.egg
+
+# Compiled C/C++
+*.o
+*.so
+*.a
+*.cmake
+CMakeCache.txt
+CMakeFiles/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs and temp files
+*.log
+nohup.out

@@ -1,0 +1,235 @@
+WAYPOINT EXTRACTION AND WAYPOINT FOLLOWER
+==========================================
+
+This document explains how the waypoint extraction and waypoint follower
+systems work and how they connect together.
+
+
+=====================================
+1. WAYPOINT EXTRACTION
+=====================================
+
+Location: src/waypoint_reader/waypoint_reader/extract_waypoints.py
+
+Purpose:
+  Extracts waypoints from ROS2 bag files containing recorded sensor data
+  and saves them to a YAML file for later autonomous navigation.
+
+Inputs:
+  - A ROS2 bag file (.db3) containing recorded topics
+  - INS data (nav_msgs/Odometry on /ins topic) - position and orientation
+  - GPS data (inertial_sense_ros2/msg/GPS on /gps topic) - optional,
+    requires 3D fix (fix_type >= 768)
+
+Configurable Parameters:
+  - distance_threshold (default 1.0m): minimum distance between waypoints
+  - smooth_window (default 50 samples): moving average window size
+  - Data source selection: --ins, --gps, or both
+
+Processing Steps:
+
+  Step 1 - Message Reading:
+    Reads the bag file and parses serialized ROS2 messages from the
+    selected topics (/ins and/or /gps).
+
+  Step 2 - Coordinate Transformation:
+    For INS data:
+      - Extracts x, y, z from Odometry position
+      - Converts quaternion orientation to yaw angle
+      - Subtracts the first INS position to establish a local frame origin
+    For GPS data:
+      - Converts geodetic coordinates (lat/lon/alt) to local ENU
+        (East-North-Up) coordinates using WGS84 Earth radius (6,378,137m)
+      - north = dlat * EARTH_RADIUS
+      - east  = dlon * EARTH_RADIUS * cos(lat0_rad)
+
+  Step 3 - Smoothing:
+    - Maintains a circular buffer of positions (size = smooth_window)
+    - Computes a moving average to reduce sensor noise
+    - Waits until the buffer is full before emitting any waypoints
+
+  Step 4 - Distance Thresholding:
+    - Only emits a new waypoint if the distance from the last emitted
+      waypoint is >= distance_threshold
+    - The first waypoint (origin) is always emitted
+    - Distance = sqrt((x - last_x)^2 + (y - last_y)^2)
+
+  Step 5 - Yaw Calculation:
+    - INS: extracted directly from the quaternion
+    - GPS: calculated from position delta using atan2(dy, dx)
+
+Output:
+  A YAML file (default: waypoints.yaml) with this structure:
+
+    waypoints:
+      - x: 0.0
+        y: 0.0
+        z: 0.0
+        yaw: -0.336
+      - x: 1.5
+        y: 2.1
+        z: 0.0
+        yaw: 0.785
+
+    frame_id: 'odom'
+    distance_threshold: 1.0
+    gps_origin:           # only present if GPS was used
+      latitude: 40.123456
+      longitude: -105.234567
+      altitude: 1609.5
+
+Usage:
+  ros2 run waypoint_reader extract_waypoints ./bag_directory
+  ros2 run waypoint_reader extract_waypoints ./bag_directory --gps
+  ros2 run waypoint_reader extract_waypoints ./bag_directory -d 0.5 -s 25 -o my_waypoints.yaml
+
+
+=====================================
+2. WAYPOINT FOLLOWER
+=====================================
+
+Location: src/waypoint_reader/waypoint_reader/waypoint_follower.py
+
+Purpose:
+  Autonomously navigates the rover through the pre-defined waypoints
+  using PID control, reading live sensor feedback and publishing
+  velocity commands.
+
+Inputs:
+  - waypoints.yaml file (loaded at startup)
+  - /ins topic (nav_msgs/Odometry) for real-time position feedback
+
+Configurable Parameters:
+  waypoint_file:      "waypoints.yaml"
+  goal_tolerance:     0.5       # meters - distance to mark waypoint reached
+  heading_threshold:  0.3       # radians (~17 deg) - triggers pure rotation
+  max_linear_vel:     0.5       # m/s
+  max_angular_vel:    1.0       # rad/s
+  heading_kp:         1.5       # heading PID proportional gain
+  heading_ki:         0.0       # heading PID integral gain
+  heading_kd:         0.1       # heading PID derivative gain
+  distance_kp:        0.5       # distance PID proportional gain
+  distance_ki:        0.0       # distance PID integral gain
+  distance_kd:        0.05      # distance PID derivative gain
+  loop:               false     # repeat waypoints continuously
+  reverse:            false     # run waypoints in reverse order
+
+Control Loop (runs at 20 Hz):
+
+  1. Wait for odometry data from /ins
+
+  2. Check if all waypoints have been reached
+     - If yes: stop (or loop back if loop=true)
+
+  3. Get the current target waypoint
+
+  4. Calculate errors:
+     - distance_error = distance from current position to target waypoint
+     - heading_error  = target_yaw - current_yaw (normalized to [-pi, pi])
+
+  5. Check if waypoint is reached:
+     - If distance < goal_tolerance: advance to next waypoint, reset PIDs
+
+  6. Compute velocity commands:
+     - If |heading_error| > heading_threshold:
+         PURE ROTATION MODE
+         angular_cmd = heading_PID(heading_error)
+         linear_cmd  = 0 (no forward motion until aligned)
+     - Else:
+         COMBINED MOTION MODE
+         linear_cmd  = distance_PID(distance_error)
+         angular_cmd = heading_PID(heading_error)
+
+  7. Clamp outputs:
+     - linear  clamped to [0, max_linear_vel]
+     - angular clamped to [-max_angular_vel, +max_angular_vel]
+
+  8. Publish to /cmd_vel (geometry_msgs/Twist)
+     - linear.x  = forward velocity (m/s)
+     - angular.z  = rotation velocity (rad/s)
+
+  9. Log status every 1 second (waypoint number, distance, heading error)
+
+PID Controller Details:
+  output = kp * error + ki * integral_error + kd * derivative_error
+  - Integral term has anti-windup clamping
+  - Output is clamped to min/max bounds
+  - Integrators reset when advancing to a new waypoint
+
+Output:
+  /cmd_vel topic (geometry_msgs/Twist) at 20 Hz containing linear and
+  angular velocity commands that drive the rover.
+
+Usage:
+  ros2 launch waypoint_reader waypoint_follower.launch.py
+  ros2 launch waypoint_reader waypoint_follower.launch.py \
+    waypoint_file:=/path/to/waypoints.yaml \
+    goal_tolerance:=0.3 \
+    max_linear_vel:=0.75 \
+    loop:=true
+
+
+=====================================
+3. HOW THEY CONNECT
+=====================================
+
+The two components form a two-phase workflow:
+
+  Phase 1 (Offline): EXTRACTION
+    Record a ROS2 bag while manually driving the rover along the
+    desired path. Then run extract_waypoints on that bag file.
+    This produces a YAML file of smoothed, evenly-spaced waypoints
+    in the local odometry frame.
+
+  Phase 2 (Online): FOLLOWING
+    The waypoint_follower node loads the YAML file and subscribes
+    to live /ins data. It uses PID control to steer the rover
+    through each waypoint in sequence, publishing velocity commands
+    on /cmd_vel.
+
+Data Flow:
+
+  [Manual Drive] --> [ROS2 Bag Recording]
+                          |
+                          v
+                   extract_waypoints
+                          |
+                          v
+                    waypoints.yaml
+                          |
+                          v
+                   waypoint_follower
+                     |          |
+              reads /ins    publishes /cmd_vel
+                     |          |
+                     v          v
+                   [Rover Navigation]
+
+Both systems share:
+  - The same local coordinate frame (origin = first INS position)
+  - The same yaw calculation (quaternion to atan2 conversion)
+  - x, y position conventions in the odom frame
+
+
+=====================================
+4. TUNING GUIDE
+=====================================
+
+Extraction Tuning:
+  - distance_threshold: Lower values create denser waypoints (more
+    precise path following but more waypoints to process). Higher
+    values create sparser waypoints (faster but less precise).
+  - smooth_window: Larger values produce smoother paths but introduce
+    more lag in the position estimate.
+
+Following Tuning:
+  - goal_tolerance: Smaller = more accurate waypoint hitting but
+    slower overall; larger = faster progression but less precise.
+  - heading_threshold: Smaller = more rotation-in-place corrections;
+    larger = more steering while driving forward.
+  - PID gains:
+    - Increase kp for faster response (risk of oscillation)
+    - Increase kd to dampen oscillations
+    - Use ki sparingly to correct steady-state error
+  - max_linear_vel / max_angular_vel: Set based on terrain and rover
+    capabilities.

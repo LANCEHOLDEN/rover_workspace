@@ -1,0 +1,26 @@
+waypoint_follower:
+  ros__parameters:
+    # Waypoint file path
+    waypoint_file: "waypoints.yaml"
+
+    # Navigation tolerances
+    goal_tolerance: 0.5        # meters - distance to consider waypoint reached
+    heading_threshold: 0.3     # radians (~17 deg) - threshold to turn in place
+
+    # Velocity limits
+    max_linear_vel: 0.5        # m/s
+    max_angular_vel: 1.0       # rad/s
+
+    # Heading PID gains
+    heading_kp: 1.5
+    heading_ki: 0.0
+    heading_kd: 0.1
+
+    # Distance PID gains
+    distance_kp: 0.5
+    distance_ki: 0.0
+    distance_kd: 0.05
+
+    # Behavior
+    loop: false                # Loop waypoints continuously
+    reverse: false             # Run waypoints in reverse order

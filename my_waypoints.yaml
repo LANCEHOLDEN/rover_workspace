@@ -1,0 +1,7 @@
+distance_threshold: 1.0
+frame_id: body
+waypoints:
+- x: 3868635.0
+  y: -9147989.0
+  yaw: -1.2219579551977935
+  z: -260.3906555175781
