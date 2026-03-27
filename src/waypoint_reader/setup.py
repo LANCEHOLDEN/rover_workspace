@@ -25,6 +25,8 @@ setup(
         'console_scripts': [
             'extract_waypoints = waypoint_reader.extract_waypoints:main',
             'waypoint_follower = waypoint_reader.waypoint_follower:main',
+            'odom_to_path = waypoint_reader.odom_to_path:main',
+            'ins_localizer = waypoint_reader.ins_localizer:main',
         ],
     },
 )

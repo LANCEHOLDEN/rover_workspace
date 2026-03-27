@@ -142,7 +142,7 @@ class WaypointExtractor:
     def extract(self):
         """Extract waypoints from the bag file."""
         print(f"Reading bag: {self.bag_path}")
-        print(f"Sources: INS={self.use_ins}, GPS={self.use_gps}")
+        print(f"Sources: /odometry/filtered={self.use_ins}, GPS={self.use_gps}")
         print(f"Distance threshold: {self.distance_threshold}m")
         print(f"Smoothing window: {self.smooth_window} samples")
         print("-" * 50)
@@ -166,7 +166,7 @@ class WaypointExtractor:
             messages.sort(key=lambda x: x[0])
 
             for timestamp, connection, rawdata in messages:
-                if connection.topic == '/ins' and self.use_ins:
+                if connection.topic == '/odometry/filtered' and self.use_ins:
                     self._process_ins_rosbags(rawdata, connection.msgtype)
                 elif connection.topic == '/gps' and self.use_gps:
                     self._process_gps_rosbags(rawdata, connection.msgtype)
@@ -194,7 +194,7 @@ class WaypointExtractor:
         # Read messages sorted by timestamp
         cursor.execute("SELECT topic_id, timestamp, data FROM messages ORDER BY timestamp")
 
-        ins_topic_id = topics.get('/ins', (None, None))[0]
+        ins_topic_id = topics.get('/odometry/filtered', (None, None))[0]
         gps_topic_id = topics.get('/gps', (None, None))[0]
 
         for topic_id, timestamp, data in cursor.fetchall():
@@ -342,7 +342,7 @@ class WaypointExtractor:
         """Print extraction summary."""
         print("-" * 50)
         print("Summary:")
-        print(f"  INS messages processed: {self.ins_count}")
+        print(f"  /odometry/filtered messages processed: {self.ins_count}")
         print(f"  GPS messages processed: {self.gps_count}")
         print(f"  Waypoints extracted: {len(self.waypoints)}")
 
@@ -400,13 +400,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
-  # Extract from INS data (default)
+  # Extract from /odometry/filtered data (default)
   ros2 run waypoint_reader extract_waypoints ./bag_files/data3
 
   # Extract from GPS data
   ros2 run waypoint_reader extract_waypoints ./bag_files/data3 --gps
 
-  # Use both INS and GPS, save to custom file
+  # Use both /odometry/filtered and GPS, save to custom file
   ros2 run waypoint_reader extract_waypoints ./bag_files/data3 --ins --gps -o my_waypoints.yaml
 
   # Denser waypoints (0.5m apart)
