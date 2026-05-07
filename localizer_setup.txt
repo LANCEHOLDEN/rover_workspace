@@ -1,0 +1,161 @@
+================================================================================
+  SIMPLE LOCALIZATION STACK — HOW IT WORKS AND WHERE TO CONFIGURE IT
+================================================================================
+
+LAUNCH COMMANDS
+---------------
+Terminal 1 (hardware drivers + INS):
+  ros2 launch roverrobotics_driver ins_fusion.launch.py
+
+Terminal 2 (localization stack):
+  ros2 launch roverrobotics_driver simple_fusion.launch.py
+
+Waypoint follower (use filtered = GPS-corrected):
+  ros2 run waypoint_reader bang_waypoint_follower \
+      --ros-args -p waypoint_file:=/path/to/waypoints.yaml \
+                 -p odom_source:=filtered
+
+
+================================================================================
+  DATA FLOW — WHERE EVERY INPUT COMES FROM
+================================================================================
+
+/imu  (sensor_msgs/Imu, raw NED, backward-mounted)
+  └─→  imu_enu_republisher  ──→  /imu/enu  (ENU, axes corrected)
+                                    │
+                                    ▼
+/odometry/wheels  ──────────────→  LOCAL EKF  ──→  /odometry/local
+(nav_msgs/Odometry, from rover       (ekf_node)        odom → base_link TF
+ driver wheel encoders)              │
+                                     │
+/ins  (nav_msgs/Odometry, NED)       │
+  └─→  ned_to_enu  ─→  /ins_enu  ───┘
+       (yaw-only,    (heading only,
+        abs heading)  corrected for
+                      backward mount)
+
+/gps  (inertial_sense GPS msg)
+  └─→  simple_gps_odom  ──→  /gps_odom  ──→  GLOBAL EKF  ──→  /odometry/filtered
+       (averages 20 fixes       (nav_msgs/Odometry,  (ekf_node)   map → odom TF
+        for datum, converts      ENU metres from
+        lat/lon to metres)       GPS datum)
+
+
+================================================================================
+  WHAT EACH OUTPUT TOPIC MEANS
+================================================================================
+
+/odometry/local
+  Dead-reckoned position from wheel encoders + IMU gyro.
+  Frame: odom (relative to where the rover was when you launched).
+  Heading: initialized from INS at startup, then maintained by gyro.
+  Use this for: smooth motion, not affected by GPS noise.
+  Problem: drifts over long distances (wheel slip, IMU drift).
+
+/odometry/filtered
+  GPS-corrected position.  Dead reckoning between GPS updates.
+  Frame: map (absolute, referenced to GPS datum set at startup).
+  Use this for: long-distance navigation, repeatable GPS waypoints.
+  Problem: can jump when GPS signal degrades.
+
+USE odom_source:=filtered for bang_waypoint_follower outdoors.
+USE odom_source:=local if GPS is bad or you just need local navigation.
+
+
+================================================================================
+  WHERE TO CONFIGURE EACH PART
+================================================================================
+
+1. LOCAL EKF (wheels + IMU + INS heading)
+   File: src/roverrobotics_ros2/roverrobotics_driver/config/simple_local_ekf.yaml
+
+   What to tune:
+   - odom0_config: which wheel odom channels to fuse (vx, vy, vyaw)
+   - imu0_config:  which IMU channels to fuse (vyaw, ax)
+   - odom1_config: /ins_enu — currently fuses YAW ONLY (gives abs heading)
+   - process_noise_covariance: row 5 (yaw, 0.02) and row 6 (vx, 0.01) are key
+
+   No rebuild needed — YAML changes take effect on next launch.
+
+2. GPS DATUM NODE
+   File: src/waypoint_reader/waypoint_reader/simple_gps_odom.py
+
+   What to tune (via ROS params, or edit node):
+   - calib_samples (default 20): how many GPS fixes to average for the datum.
+     More = more stable datum but longer startup wait.
+   - min_fix_type (default 768): minimum GPS quality (768 = 3D fix).
+
+   Conversion formula (flat-Earth, accurate ~0.1 m per km):
+     east  = 6378137 * radians(lon - lon0) * cos(radians(lat0))
+     north = 6378137 * radians(lat - lat0)
+
+   Covariance comes from GPS h_acc field (reported by InertialSense).
+   To trust GPS MORE in the global EKF → decrease h_acc minimum clamp (line ~69).
+   To trust GPS LESS → increase h_acc minimum clamp.
+
+   Rebuild needed after editing: colcon build --packages-select waypoint_reader
+
+3. GLOBAL EKF (local odometry + GPS position)
+   File: src/roverrobotics_ros2/roverrobotics_driver/config/simple_global_ekf.yaml
+
+   What to tune:
+   - odom0_config: what to fuse from /odometry/local (x, y, yaw, vx, vyaw)
+   - odom1_config: what to fuse from /gps_odom (x, y only)
+   - process_noise_covariance: rows 0,1 (x,y = 0.5) — increase to trust GPS more
+
+   No rebuild needed — YAML changes take effect on next launch.
+
+4. INS HEADING CONVERTER
+   File: src/waypoint_reader/waypoint_reader/ned_to_enu.py
+
+   This converts the InertialSense INS output from NED to ENU and corrects for
+   the backward-mounted sensor (adds 180° to the yaw before ENU conversion).
+
+   If heading is 180° wrong: check that INS_rpy=[0,0,0] in ins_fusion.launch.py.
+   If heading drifts: the INS needs GPS to converge (~1 minute after fix acquired).
+
+   Rebuild needed after editing: colcon build --packages-select waypoint_reader
+
+
+================================================================================
+  STARTUP SEQUENCE AND TIMING
+================================================================================
+
+t=0 s   System starts. Rover driver and InertialSense nodes come up.
+t=8 s   InertialSense node starts (delayed in ins_fusion.launch.py).
+t=0 s   imu_enu_republisher and ned_to_enu start immediately.
+t=0 s   Local EKF starts. Initializes with yaw from /ins_enu (takes ~2 s).
+t=5 s   simple_gps_odom starts collecting datum samples.
+t=5-25s GPS datum collection (20 samples × ~1 Hz = ~20 s).
+t=10 s  Global EKF starts (before datum is ready — it waits for /gps_odom).
+        Once datum is ready, /odometry/filtered becomes GPS-corrected.
+
+TOTAL: /odometry/filtered is reliable ~30 seconds after launch.
+       /odometry/local is reliable ~5 seconds after launch.
+
+
+================================================================================
+  TROUBLESHOOTING
+================================================================================
+
+Problem: /odometry/local heading is wrong (rover drives sideways)
+  → Check that ned_to_enu is running: ros2 topic echo /ins_enu --once
+  → The INS needs ~60 s and some rover movement to converge heading
+  → Check INS has GPS fix: ros2 topic echo /gps --once | grep fix_type
+    (fix_type should be >= 768)
+
+Problem: /odometry/filtered drifting in one direction while stationary
+  → Check GPS quality: ros2 topic echo /gps_odom --once (watch x,y)
+  → Standard GPS can drift ±1 m — this is normal
+  → To reduce GPS noise influence, increase process_noise_covariance in
+    simple_global_ekf.yaml (makes EKF trust GPS less between updates)
+
+Problem: /gps_odom never publishes
+  → Check GPS fix: ros2 topic echo /gps --once | grep fix_type
+  → Must be >= 768 (3D fix) before datum collects
+  → Check simple_gps_odom node: ros2 node list | grep gps
+
+Problem: large jump in /odometry/filtered when GPS first comes in
+  → Normal behavior — global EKF is correcting accumulated dead-reckoning error
+  → Use /odometry/local for smooth motion, /odometry/filtered for position accuracy
+================================================================================

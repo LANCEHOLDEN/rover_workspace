@@ -1,0 +1,586 @@
+================================================================================
+  ROS1 to ROS2 Humble Migration Notes
+  Package: inertial_sense_ros2_V2
+  SDK: InertialSense SDK 1.12.0
+  Date: 2026-03-23
+================================================================================
+
+This document explains every change made to convert the inertial_sense_ros
+(ROS1 / catkin) package into inertial_sense_ros2_v2 (ROS2 Humble / ament_cmake).
+Changes are grouped by category.
+
+--------------------------------------------------------------------------------
+SECTION 1: BUILD SYSTEM (CMakeLists.txt + package.xml)
+--------------------------------------------------------------------------------
+
+1.1  Build tool: catkin -> ament_cmake
+     -----------------------------------------------------------------------
+     ROS1:  find_package(catkin REQUIRED COMPONENTS ...)
+            catkin_package(...)
+     ROS2:  find_package(ament_cmake REQUIRED)
+            ament_package()
+
+     Why: ROS2 replaced the catkin build system with ament_cmake. ament_cmake
+     uses install() and ament_target_dependencies() instead of catkin's macros.
+     Every ROS2 package must call ament_package() at the end of CMakeLists.txt.
+
+1.2  Message/service generation: add_message_files -> rosidl_generate_interfaces
+     -----------------------------------------------------------------------
+     ROS1:  add_message_files(FILES GPS.msg ...)
+            add_service_files(FILES FirmwareUpdate.srv ...)
+            generate_messages(DEPENDENCIES std_msgs geometry_msgs)
+     ROS2:  rosidl_generate_interfaces(${PROJECT_NAME}
+              "msg/GPS.msg" ...
+              "srv/FirmwareUpdate.srv" ...
+              DEPENDENCIES std_msgs geometry_msgs)
+            rosidl_get_typesupport_target(cpp_typesupport_target ...)
+            target_link_libraries(node "${cpp_typesupport_target}")
+
+     Why: ROS2 uses the rosidl pipeline instead of catkin's message generation.
+     The generated C++ headers now live under a namespace matching the package
+     name (e.g. inertial_sense_ros2_v2::msg::GPS) instead of the flat
+     inertial_sense/GPS.h style used in ROS1. The typesupport target must be
+     explicitly linked to the executable.
+
+1.3  Dependency declarations in package.xml
+     -----------------------------------------------------------------------
+     ROS1:  <buildtool_depend>catkin</buildtool_depend>
+            <depend>roscpp</depend>
+            <depend>message_generation</depend>
+            <exec_depend>message_runtime</exec_depend>
+     ROS2:  <buildtool_depend>ament_cmake</buildtool_depend>
+            <buildtool_depend>rosidl_default_generators</buildtool_depend>
+            <depend>rclcpp</depend>
+            <exec_depend>rosidl_default_runtime</exec_depend>
+            <member_of_group>rosidl_interface_packages</member_of_group>
+
+     Why: ament_cmake is the ROS2 build tool. The roscpp client library is
+     replaced by rclcpp. Message generation uses rosidl instead of
+     message_generation/message_runtime. The member_of_group tag is required
+     so that other packages can find and use the generated message types.
+
+1.4  New external dependencies: libusb-1.0, yaml-cpp
+     -----------------------------------------------------------------------
+     ROS1 SDK:  Not required (older SDK did not use these)
+     ROS2 SDK:  find_package(PkgConfig REQUIRED)
+                pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
+                find_package(yaml-cpp REQUIRED)
+                target_link_libraries(... ${LIBUSB_LIBRARIES} yaml-cpp)
+                target_include_directories(... ${LIBUSB_INCLUDE_DIRS})
+
+     Why: SDK 1.12.0 added DFU bootloader support (requires libusb) and YAML
+     configuration file support (requires yaml-cpp). These are system libraries
+     that must be found and linked explicitly.
+
+1.5  EXCLUDE_BOOTLOADER compile definition
+     -----------------------------------------------------------------------
+     ROS1 SDK:  Not needed
+     ROS2 SDK:  target_compile_definitions(InertialSenseSDK_V2 PRIVATE
+                  EXCLUDE_BOOTLOADER)
+
+     Why: SDK 1.12.0's bootloader code references firmware header files
+     (hw-libs/bootloader/bootloaderShared.h) that are part of the embedded
+     firmware repository and are not distributed in the SDK zip. The SDK
+     provides the EXCLUDE_BOOTLOADER preprocessor guard to cleanly compile
+     without the bootloader subsystem. Firmware updates must be done using
+     the InertialSense CLTool instead.
+
+--------------------------------------------------------------------------------
+SECTION 2: INCLUDES AND HEADERS
+--------------------------------------------------------------------------------
+
+2.1  ROS client library headers
+     -----------------------------------------------------------------------
+     ROS1:  #include "ros/ros.h"
+            #include "ros/timer.h"
+     ROS2:  #include "rclcpp/rclcpp.hpp"
+
+     Why: The entire ROS client library was rewritten for ROS2. rclcpp.hpp
+     is the single entry point that replaces ros/ros.h. There is no separate
+     timer header; timers are part of the Node interface.
+
+2.2  Message header paths
+     -----------------------------------------------------------------------
+     ROS1:  #include "sensor_msgs/Imu.h"
+            #include "nav_msgs/Odometry.h"
+            #include "inertial_sense/GPS.h"
+            (flat include, no msg/ subdirectory)
+     ROS2:  #include "sensor_msgs/msg/imu.hpp"
+            #include "nav_msgs/msg/odometry.hpp"
+            #include "inertial_sense_ros2_v2/msg/gps.hpp"
+            (snake_case filename, msg/ subdirectory, .hpp extension)
+
+     Why: ROS2 uses a strict naming convention for generated headers:
+     - Package/msg/snake_case_name.hpp
+     - The message type itself is accessed as PackageName::msg::CamelCaseName
+     In ROS1 headers were CamelCase .h files at the package root.
+
+2.3  Service header paths
+     -----------------------------------------------------------------------
+     ROS1:  #include "inertial_sense/FirmwareUpdate.h"
+            #include "std_srvs/Trigger.h"
+     ROS2:  #include "inertial_sense_ros2_v2/srv/firmware_update.hpp"
+            #include "std_srvs/srv/trigger.hpp"
+
+     Why: Same convention change as messages (srv/ subdirectory, snake_case,
+     .hpp). Service types are accessed as PackageName::srv::CamelCaseName.
+
+--------------------------------------------------------------------------------
+SECTION 3: NODE ARCHITECTURE
+--------------------------------------------------------------------------------
+
+3.1  Node class now inherits from rclcpp::Node
+     -----------------------------------------------------------------------
+     ROS1:  class InertialSenseROS
+            {
+              ros::NodeHandle nh_;
+              ros::NodeHandle nh_private_;
+            };
+     ROS2:  class InertialSenseROS : public rclcpp::Node
+            {
+              // no NodeHandle members needed
+            };
+
+     Why: In ROS1 a node was created by calling ros::init() and then creating
+     NodeHandle objects. In ROS2 each node is a class that inherits from
+     rclcpp::Node. All publisher, subscriber, service, timer, and parameter
+     functions are methods of the Node base class (this->create_publisher(),
+     this->create_subscription(), etc.). The constructor calls
+     rclcpp::Node("node_name") as its base class initializer.
+
+3.2  Node construction and spin
+     -----------------------------------------------------------------------
+     ROS1:  int main(int argc, char** argv) {
+              ros::init(argc, argv, "inertial_sense_node");
+              InertialSenseROS thing;
+              while (ros::ok()) {
+                ros::spinOnce();
+                thing.update();
+              }
+            }
+     ROS2:  int main(int argc, char** argv) {
+              rclcpp::init(argc, argv);
+              auto node = std::make_shared<InertialSenseROS>();
+              rclcpp::Rate rate(1000);
+              while (rclcpp::ok()) {
+                rclcpp::spin_some(node);
+                node->update();
+                rate.sleep();
+              }
+              rclcpp::shutdown();
+            }
+
+     Why: rclcpp::init() replaces ros::init(). Nodes are managed as shared_ptr
+     objects in ROS2. spin_some() processes pending callbacks without blocking,
+     equivalent to spinOnce(). rclcpp::shutdown() must be called explicitly
+     before exit to cleanly tear down the node.
+
+--------------------------------------------------------------------------------
+SECTION 4: PARAMETERS
+--------------------------------------------------------------------------------
+
+4.1  Parameter declaration and reading
+     -----------------------------------------------------------------------
+     ROS1:  nh_private_.param<std::string>("port", port_, "/dev/ttyUSB0");
+            nh_private_.param<int>("baudrate", baudrate_, 921600);
+            if (nh_private_.hasParam("nav_dt_ms"))
+              nh_private_.getParam("nav_dt_ms", nav_dt_ms);
+     ROS2:  port_     = this->declare_parameter<std::string>("port", "/dev/ttyACM0");
+            baudrate_ = this->declare_parameter<int>("baudrate", 921600);
+            nav_dt_ms = this->declare_parameter<int>("navigation_dt_ms", 10);
+
+     Why: ROS2 requires parameters to be declared before they can be read.
+     declare_parameter() both declares the parameter with a default value AND
+     returns the current value (set via launch file or command line). In ROS1
+     the parameter server was a global key-value store; in ROS2 parameters are
+     owned by the node and must be explicitly declared. The private namespace
+     ("~") no longer exists; all parameters are accessed through the node
+     directly.
+
+4.2  Vector parameters
+     -----------------------------------------------------------------------
+     ROS1:  std::vector<double> tmp(size, 0);
+            nh_private_.getParam(param_name, tmp);
+     ROS2:  std::vector<double> tmp(size, 0.0);
+            if (this->has_parameter(param_name))
+              tmp = this->get_parameter(param_name).as_double_array();
+            else
+              this->declare_parameter<std::vector<double>>(param_name, tmp);
+
+     Why: ROS2 parameter values are typed. Vectors of doubles use
+     as_double_array(). has_parameter() is used to check if a parameter was
+     already declared (e.g. by the launch file) before declaring it with a
+     default.
+
+--------------------------------------------------------------------------------
+SECTION 5: PUBLISHERS
+--------------------------------------------------------------------------------
+
+5.1  Creating publishers
+     -----------------------------------------------------------------------
+     ROS1:  ros::Publisher pub;
+            pub = nh_.advertise<nav_msgs::Odometry>("ins", 1);
+            pub.publish(odom_msg);
+     ROS2:  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub;
+            pub = this->create_publisher<nav_msgs::msg::Odometry>("ins", 1);
+            pub->publish(odom_msg);
+
+     Why: ROS2 publishers are templated on the message type and are accessed
+     through a shared pointer. create_publisher() replaces advertise(). The
+     topic namespace no longer changes based on the NodeHandle used (nh_ vs
+     nh_private_); topic names work the same way in ROS2 as they would with
+     nh_ in ROS1.
+
+5.2  Storing heterogeneous publishers in a struct
+     -----------------------------------------------------------------------
+     ROS1:  struct ros_stream_t {
+              ros::Publisher pub;
+              ros::Publisher pub2;
+            };
+     ROS2:  struct ros_stream_t {
+              rclcpp::PublisherBase::SharedPtr pub;
+              rclcpp::PublisherBase::SharedPtr pub2;
+            };
+            // Cast back to typed publisher when publishing:
+            auto p = std::dynamic_pointer_cast<
+              rclcpp::Publisher<nav_msgs::msg::Odometry>>(INS_.pub);
+            if (p) p->publish(odom_msg);
+
+     Why: ROS2 does not have a type-erased ros::Publisher equivalent. Instead
+     the base class rclcpp::PublisherBase::SharedPtr is used for storage, and
+     dynamic_pointer_cast restores the typed publisher when publishing. This
+     is required because the ros_stream_t struct holds publishers for different
+     message types depending on which streams are enabled.
+
+5.3  Message type namespace
+     -----------------------------------------------------------------------
+     ROS1:  nav_msgs::Odometry  odom_msg;
+            sensor_msgs::Imu    imu_msg;
+     ROS2:  nav_msgs::msg::Odometry  odom_msg;
+            sensor_msgs::msg::Imu    imu_msg;
+
+     Why: All ROS2 message types live inside a ::msg:: sub-namespace. This is
+     consistent across all packages and prevents naming collisions.
+
+--------------------------------------------------------------------------------
+SECTION 6: SUBSCRIPTIONS
+--------------------------------------------------------------------------------
+
+6.1  Creating subscriptions
+     -----------------------------------------------------------------------
+     ROS1:  ros::Subscriber sub;
+            sub = nh_.subscribe("joint_states", 20,
+                    &InertialSenseROS::wheel_enc_callback, this);
+     ROS2:  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub;
+            sub = this->create_subscription<sensor_msgs::msg::JointState>(
+              "joint_states", 20,
+              [this](const sensor_msgs::msg::JointState::SharedPtr msg) {
+                wheel_enc_callback(msg); });
+
+     Why: create_subscription() replaces subscribe(). In ROS2 callbacks can be
+     lambdas, std::bind expressions, or free functions. The message is passed
+     as a shared pointer (::SharedPtr) rather than a const reference in many
+     cases. The queue size second argument is now a QoS parameter; passing an
+     integer keeps it simple (Best Effort, depth N).
+
+6.2  Callback signature
+     -----------------------------------------------------------------------
+     ROS1:  void wheel_enc_callback(
+              const sensor_msgs::JointStateConstPtr& msg)
+     ROS2:  void wheel_enc_callback(
+              const sensor_msgs::msg::JointState::SharedPtr msg)
+
+     Why: ROS2 callbacks receive a shared pointer (::SharedPtr) to the message.
+     The ConstPtr typedef does not exist in ROS2. SharedPtr provides the same
+     lifetime guarantees as ConstPtr did in ROS1.
+
+--------------------------------------------------------------------------------
+SECTION 7: SERVICES
+--------------------------------------------------------------------------------
+
+7.1  Creating services
+     -----------------------------------------------------------------------
+     ROS1:  mag_cal_srv_ = nh_.advertiseService(
+              "single_axis_mag_cal",
+              &InertialSenseROS::perform_mag_cal_srv_callback, this);
+     ROS2:  mag_cal_srv_ = this->create_service<std_srvs::srv::Trigger>(
+              "single_axis_mag_cal",
+              [this](const std_srvs::srv::Trigger::Request::SharedPtr req,
+                     std_srvs::srv::Trigger::Response::SharedPtr res)
+              { perform_mag_cal_srv_callback(req, res); });
+
+     Why: create_service() replaces advertiseService(). The service type is now
+     a template parameter on create_service(). Callbacks receive separate
+     shared pointers to the request and response objects.
+
+7.2  Service callback signature
+     -----------------------------------------------------------------------
+     ROS1:  bool perform_mag_cal_srv_callback(
+              std_srvs::Trigger::Request& req,
+              std_srvs::Trigger::Response& res)
+     ROS2:  bool perform_mag_cal_srv_callback(
+              const std_srvs::srv::Trigger::Request::SharedPtr req,
+              std_srvs::srv::Trigger::Response::SharedPtr res)
+
+     Why: ROS2 service callbacks take shared pointers to request and response
+     instead of references. Request and Response types are nested inside the
+     service type (std_srvs::srv::Trigger::Request) rather than being separate
+     structs.
+
+--------------------------------------------------------------------------------
+SECTION 8: TIMERS
+--------------------------------------------------------------------------------
+
+8.1  Creating timers
+     -----------------------------------------------------------------------
+     ROS1:  obs_bundle_timer_ = nh_.createTimer(
+              ros::Duration(0.001),
+              InertialSenseROS::GPS_obs_bundle_timer_callback, this);
+     ROS2:  obs_bundle_timer_ = this->create_wall_timer(
+              std::chrono::milliseconds(1),
+              [this]() { GPS_obs_bundle_timer_callback(); });
+
+     Why: create_wall_timer() replaces createTimer(). Duration is specified
+     using std::chrono types instead of ros::Duration. The callback is a
+     zero-argument callable (lambda or std::function<void()>) rather than a
+     function taking a ros::TimerEvent argument.
+
+8.2  Timer callback signature
+     -----------------------------------------------------------------------
+     ROS1:  void GPS_obs_bundle_timer_callback(const ros::TimerEvent& e)
+     ROS2:  void GPS_obs_bundle_timer_callback()
+
+     Why: ROS2 wall timer callbacks take no arguments. If timing information
+     is needed, it must be obtained by calling this->now() inside the callback.
+
+--------------------------------------------------------------------------------
+SECTION 9: TIME
+--------------------------------------------------------------------------------
+
+9.1  Current time
+     -----------------------------------------------------------------------
+     ROS1:  ros::Time::now()
+     ROS2:  this->now()
+
+     Why: In ROS2, time is obtained through the node because each node can use
+     either the system clock or a simulated clock (for bag playback). this->now()
+     returns the appropriate time source for the node's context.
+
+9.2  Constructing timestamps
+     -----------------------------------------------------------------------
+     ROS1:  rostime = ros::Time(sec, nsec);
+     ROS2:  return rclcpp::Time(static_cast<int32_t>(sec),
+                                static_cast<uint32_t>(nsec));
+
+     Why: rclcpp::Time replaces ros::Time. The constructor arguments are the
+     same (seconds, nanoseconds) but explicit casts are needed because rclcpp
+     uses int32_t for seconds (RCL time type). ros::Time used uint32_t for
+     seconds.
+
+9.3  Duration comparison
+     -----------------------------------------------------------------------
+     ROS1:  (ros::Time::now() - last_obs_time_).toSec() > 1e-2
+     ROS2:  (this->now() - last_obs_time_).seconds() > 1e-2
+
+     Why: rclcpp::Duration uses .seconds() instead of .toSec() to get the
+     duration as a floating-point value.
+
+--------------------------------------------------------------------------------
+SECTION 10: LOGGING
+--------------------------------------------------------------------------------
+
+10.1  Log macros
+     -----------------------------------------------------------------------
+     ROS1:  ROS_INFO("message %s", str.c_str());
+            ROS_WARN("...");
+            ROS_ERROR("...");
+            ROS_FATAL("...");
+            ROS_ERROR_COND(condition, "...");
+            ROS_INFO_STREAM("text " << value);
+     ROS2:  RCLCPP_INFO(this->get_logger(), "message %s", str.c_str());
+            RCLCPP_WARN(this->get_logger(), "...");
+            RCLCPP_ERROR(this->get_logger(), "...");
+            RCLCPP_FATAL(this->get_logger(), "...");
+            // No COND variant - use if() instead
+            // No STREAM variant - use printf formatting
+
+     Why: ROS2 logging macros require a logger object as the first argument.
+     this->get_logger() returns the node's named logger which ensures log
+     messages are attributed to the correct node. The ROS1 global logging
+     context no longer exists.
+
+--------------------------------------------------------------------------------
+SECTION 11: SDK 1.12.0 API CHANGES
+     (These are required because SDK 1.12.0 renamed and restructured data types.
+      The behavior is identical - only the C struct/define names changed.)
+--------------------------------------------------------------------------------
+
+11.1  IMU data: DID_DUAL_IMU / dual_imu_t -> DID_IMU / imu_t
+     -----------------------------------------------------------------------
+     ROS1 SDK:  SET_CALLBACK(DID_DUAL_IMU, dual_imu_t, IMU_callback);
+                void IMU_callback(const dual_imu_t* const msg) {
+                  msg->I[0].pqr[0];   // first IMU pqr
+                  msg->I[0].acc[0];   // first IMU acc
+                }
+     ROS2 SDK:  SET_CALLBACK(DID_IMU, imu_t, IMU_callback);
+                void IMU_callback(const imu_t* const msg) {
+                  msg->I.pqr[0];      // single IMU pqr
+                  msg->I.acc[0];      // single IMU acc
+                }
+
+     Why: SDK 1.12.0 consolidated the dual-IMU design. DID_DUAL_IMU provided
+     raw data from two separate IMU sensors; DID_IMU provides the calibrated
+     and averaged output. The outer array [0]/[1] was removed - there is now
+     a single imus_t field named I. The functionality is equivalent for our
+     use case (we only used I[0] anyway).
+
+11.2  Pre-integrated IMU: DID_PREINTEGRATED_IMU / preintegrated_imu_t
+                       -> DID_PIMU / pimu_t
+     -----------------------------------------------------------------------
+     ROS1 SDK:  SET_CALLBACK(DID_PREINTEGRATED_IMU, preintegrated_imu_t, ...);
+                msg->theta1[0];   // delta angle
+                msg->vel1[0];     // delta velocity
+     ROS2 SDK:  SET_CALLBACK(DID_PIMU, pimu_t, ...);
+                msg->theta[0];    // delta angle
+                msg->vel[0];      // delta velocity
+
+     Why: The data set was renamed from "Preintegrated IMU" to "PIMU" (Pi-Mu)
+     throughout SDK 1.12.0. The struct fields were also renamed from theta1/vel1
+     to theta/vel (the "1" suffix was a legacy artifact from when dual-IMU was
+     supported at this level).
+
+11.3  Magnetometer DID: DID_MAGNETOMETER_1 -> DID_MAGNETOMETER
+     -----------------------------------------------------------------------
+     ROS1 SDK:  SET_CALLBACK(DID_MAGNETOMETER_1, magnetometer_t, mag_callback);
+     ROS2 SDK:  SET_CALLBACK(DID_MAGNETOMETER, magnetometer_t, mag_callback);
+
+     Why: The "_1" suffix was removed when the dual-magnetometer architecture
+     was simplified. DID_MAGNETOMETER now refers to the primary magnetometer
+     output. The magnetometer_t struct itself is unchanged.
+
+11.4  RTK data IDs renamed
+     -----------------------------------------------------------------------
+     ROS1 SDK:  DID_GPS1_RTK_MISC  -> used for RTK rover
+                DID_GPS1_RTK_REL   -> used for RTK rover
+     ROS2 SDK:  DID_GPS1_RTK_POS_MISC  -> RTK positioning misc data
+                DID_GPS1_RTK_POS_REL   -> RTK positioning relative data
+                DID_GPS2_RTK_CMP_MISC  -> dual GNSS compassing misc data
+                DID_GPS2_RTK_CMP_REL   -> dual GNSS compassing relative data
+
+     Why: SDK 1.12.0 made the distinction between RTK positioning and RTK
+     compassing (dual-GNSS heading) explicit in the DID names. The old names
+     were ambiguous. GPS2 RTK CMP DIDs are used specifically for dual-GNSS
+     compassing mode.
+
+11.5  RTK config bits renamed
+     -----------------------------------------------------------------------
+     ROS1 SDK:  RTKCfgBits |= RTK_CFG_BITS_GPS1_RTK_ROVER;   // rover mode
+                RTKCfgBits |= RTK_CFG_BITS_COMPASSING;        // dual GNSS
+     ROS2 SDK:  RTKCfgBits |= RTK_CFG_BITS_ROVER_MODE_RTK_POSITIONING;   // rover
+                RTKCfgBits |= RTK_CFG_BITS_ROVER_MODE_RTK_COMPASSING;    // dual GNSS
+
+     Why: The bit definitions were reorganized into a ROVER_MODE bitmask field
+     in SDK 1.12.0, making the configuration more explicit and allowing future
+     mode combinations.
+
+11.6  GPS velocity field: velEcef[] -> vel[]
+     -----------------------------------------------------------------------
+     ROS1 SDK:  gps_vel_t::velEcef[0]  // ECEF velocity
+     ROS2 SDK:  gps_vel_t::vel[0]      // ECEF or NED velocity
+
+     Why: The field was renamed to vel[] because SDK 1.12.0 allows the GPS
+     velocity to be in either ECEF or local tangent (NED) frame depending on
+     the GPS_STATUS_FLAGS_GPS_NMEA_DATA status bit. The field name was
+     generalized accordingly. For a standard GPS fix without NMEA, this is
+     still ECEF velocity, so behavior is unchanged.
+
+11.7  RTK relative data fields renamed
+     -----------------------------------------------------------------------
+     ROS1 SDK:  gps_rtk_rel_t::vectorToBase[3]
+                gps_rtk_rel_t::distanceToBase
+                gps_rtk_rel_t::headingToBase
+     ROS2 SDK:  gps_rtk_rel_t::baseToRoverVector[3]
+                gps_rtk_rel_t::baseToRoverDistance
+                gps_rtk_rel_t::baseToRoverHeading
+
+     Why: The direction convention of the names was corrected. "vectorToBase"
+     implied a rover->base direction but the data actually represents the
+     base->rover vector. The renamed fields clarify the direction convention.
+     Values are equivalent.
+
+11.8  Flash config read API change
+     -----------------------------------------------------------------------
+     ROS1 SDK:  nvm_flash_cfg_t& cfg = IS_.GetFlashConfig();
+                int nav_dt_ms = IS_.GetFlashConfig().startupNavDtMs;
+     ROS2 SDK:  nvm_flash_cfg_t flash;
+                IS_.GetFlashConfig(flash);   // fills flash by reference, returns bool
+                int nav_dt_ms = flash.startupNavDtMs;
+
+     Why: SDK 1.12.0 changed GetFlashConfig() from returning an internal
+     reference to filling a caller-provided struct. This makes ownership
+     clearer and allows the function to return a success/failure bool (in
+     case flash config has not yet been downloaded from the device).
+
+11.9  Server connection: OpenServerConnection -> OpenConnectionToServer
+     -----------------------------------------------------------------------
+     ROS1 SDK:  IS_.OpenServerConnection(RTK_connection)
+     ROS2 SDK:  IS_.OpenConnectionToServer(RTK_connection)
+
+     Why: The method was renamed for clarity in SDK 1.12.0. The connection
+     string format (TYPE:IP:PORT) and behavior are unchanged.
+
+11.10 Device reset: DID_CONFIG / config_t -> DID_SYS_CMD / system_command_t
+     -----------------------------------------------------------------------
+     ROS1 SDK:  config_t reset_command;
+                reset_command.system    = 99;
+                reset_command.invSystem = ~reset_command.system;
+                IS_.SendData(DID_CONFIG, ...);
+     ROS2 SDK:  system_command_t reset_command;
+                reset_command.command    = 99;   // 99 = software reset
+                reset_command.invCommand = ~reset_command.command;
+                IS_.SendData(DID_SYS_CMD, ...);
+
+     Why: DID_CONFIG and config_t were replaced by DID_SYS_CMD and
+     system_command_t in SDK 1.12.0. The new struct uses command/invCommand
+     field names instead of system/invSystem. The value 99 still means software
+     reset. The inverted field is a safety mechanism to prevent accidental
+     resets from corrupted data - behavior unchanged.
+
+11.11 Magnetometer calibration field: enMagRecal -> state
+     -----------------------------------------------------------------------
+     ROS1 SDK:  offsetof(mag_cal_t, enMagRecal)
+                value 1 = single-axis, value 0 = multi-axis
+     ROS2 SDK:  offsetof(mag_cal_t, state)
+                value 2 = single-axis, value 1 = multi-axis
+
+     Why: The mag_cal_t struct was redesigned in SDK 1.12.0. The field was
+     renamed from enMagRecal (enable mag recalibration) to state (calibration
+     state machine state), and the command values were renumbered to align with
+     the eMagCalState enum (1=multi-axis, 2=single-axis, 101=abort,
+     200+=status codes).
+
+11.12 magInclination removed from flash config
+     -----------------------------------------------------------------------
+     ROS1 SDK:  set_flash_config<float>("inclination",
+                  offsetof(nvm_flash_cfg_t, magInclination), 1.14878f);
+     ROS2 SDK:  (removed - no equivalent field)
+
+     Why: nvm_flash_cfg_t::magInclination no longer exists in SDK 1.12.0.
+     Magnetic inclination is now computed internally by the device's onboard
+     World Magnetic Model (WMM) using the GPS position fix. The declination
+     field (magDeclination) is still present and still configurable.
+
+11.13 Log preset: RMC_PRESET_PPD_ROBOT -> RMC_PRESET_PPD_BITS
+     -----------------------------------------------------------------------
+     ROS1 SDK:  IS_.SetLoggerEnabled(true, filename,
+                  cISLogger::LOGTYPE_DAT, RMC_PRESET_PPD_ROBOT);
+     ROS2 SDK:  IS_.SetLoggerEnabled(true, filename,
+                  cISLogger::LOGTYPE_DAT, RMC_PRESET_PPD_BITS);
+
+     Why: RMC_PRESET_PPD_ROBOT was renamed to RMC_PRESET_PPD_BITS in SDK
+     1.12.0 as part of a cleanup of the RMC preset naming convention. The
+     actual set of data logged is equivalent.
+
+================================================================================
+END OF MIGRATION NOTES
+================================================================================

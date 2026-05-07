@@ -51,23 +51,23 @@ class WaypointFollower(Node):
 
         # Declare parameters
         self.declare_parameter('waypoint_file', 'waypoints.yaml')
-        self.declare_parameter('goal_tolerance', 0.05)
+        self.declare_parameter('goal_tolerance', 0.3)
         self.declare_parameter('max_linear_vel', 0.3)
-        self.declare_parameter('max_angular_vel', 1.0)
+        self.declare_parameter('max_angular_vel', 2.2)
         self.declare_parameter('heading_threshold', 0.175)  # radians (~10 deg)
         self.declare_parameter('loop', False)  # Loop through waypoints
         self.declare_parameter('reverse', False)  # Run waypoints in reverse
         self.declare_parameter('stuck_timeout', 15.0)  # seconds before declaring stuck
         self.declare_parameter('stuck_distance_threshold', 0.05)  # meters
-        self.declare_parameter('min_angular_vel', 1.8)   # minimum angular cmd to overcome stiction
+        self.declare_parameter('min_angular_vel', 1.5)   # minimum angular cmd to overcome stiction
         self.declare_parameter('min_linear_vel', 0.2)    # minimum linear cmd for consistent forward speed
         self.declare_parameter('yaw_smooth_alpha', 0.14)     # EMA for yaw (0=frozen, 1=raw)
         self.declare_parameter('heading_error_smooth_alpha', 0.20)  # EMA for heading error
 
         # PID gains
-        self.declare_parameter('heading_kp', 1.05)
-        self.declare_parameter('heading_ki', 0.0)
-        self.declare_parameter('heading_kd', 0.3)
+        self.declare_parameter('heading_kp', 1.2)
+        self.declare_parameter('heading_ki', 0.02)
+        self.declare_parameter('heading_kd', 0.6)
         self.declare_parameter('distance_kp', 0.5)
         self.declare_parameter('distance_ki', 0.0)
         self.declare_parameter('distance_kd', 0.05)
@@ -145,7 +145,7 @@ class WaypointFollower(Node):
         # Publishers and subscribers
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.odom_sub = self.create_subscription(
-            Odometry, '/odometry/filtered', self._odom_callback, 10)
+            Odometry, '/odometry/wheels', self._odom_callback, 10)
 
         # Control loop at 20 Hz
         self.control_timer = self.create_timer(0.05, self._control_loop)
@@ -159,7 +159,7 @@ class WaypointFollower(Node):
         self.get_logger().info(f'  Max linear vel: {self.max_linear} m/s')
         self.get_logger().info(f'  Max angular vel: {self.max_angular} rad/s')
         self.get_logger().info(f'  Loop mode: {self.loop}')
-        self.get_logger().info('Waiting for /odometry/filtered...')
+        self.get_logger().info('Waiting for /odometry/wheels...')
 
     def _load_waypoints(self, filepath):
         """Load waypoints from YAML file."""
@@ -191,7 +191,7 @@ class WaypointFollower(Node):
         return angle
 
     def _odom_callback(self, msg):
-        """Update position and heading from /odometry/filtered."""
+        """Update position and heading from /odometry/wheels."""
         raw_x = msg.pose.pose.position.x
         raw_y = msg.pose.pose.position.y
 
@@ -267,9 +267,8 @@ class WaypointFollower(Node):
         dy = target_y - self.current_y
         distance = math.sqrt(dx * dx + dy * dy)
         target_heading = math.atan2(dy, dx)
-        # NOTE: EKF yaw uses NED convention (CW = +yaw), so heading error is
-        # computed as (current - target) to get correct negative-feedback sign.
-        raw_heading_error = self._normalize_angle(self.current_yaw - target_heading)
+        # EKF yaw is ENU convention (CCW = +yaw), standard negative-feedback sign.
+        raw_heading_error = self._normalize_angle(target_heading - self.current_yaw)
         if self.smooth_heading_error is None:
             self.smooth_heading_error = raw_heading_error
         else:
@@ -299,7 +298,7 @@ class WaypointFollower(Node):
             self.heading_pid.reset()
             self.distance_pid.reset()
             self.smooth_heading_error = None
-            self.turning = False
+            self.turning = True
             self.braking = True
             self.brake_cycles_remaining = self.BRAKE_CYCLES
             # Reset stuck detector for next waypoint
@@ -356,8 +355,8 @@ class WaypointFollower(Node):
                 self.braking = False
             # cmd is already zero-initialized — just publish it
         elif self.turning:
-            # Turn in place
-            angular = self.heading_pid.compute(heading_error, dt)
+            # Turn in place — use raw heading error directly (no EMA lag during turns)
+            angular = self.heading_pid.compute(raw_heading_error, dt)
             # Apply floor throughout the turn to overcome stiction
             if abs(angular) > 0.01:
                 angular = math.copysign(max(abs(angular), self.min_angular_vel), angular)
@@ -368,11 +367,15 @@ class WaypointFollower(Node):
             linear = self.distance_pid.compute(distance, dt)
             # Apply floor for consistent speed — prevents tapering to a crawl near waypoint
             cmd.linear.x = max(linear, self.min_linear_vel)
-            angular = self.heading_pid.compute(heading_error, dt)
-            # Apply floor only for meaningful corrections while driving
-            if abs(heading_error) > 0.15 and abs(angular) > 0.01:
-                angular = math.copysign(max(abs(angular), self.min_angular_vel * 0.5), angular)
-            cmd.angular.z = angular
+            # Suppress angular correction in the final approach — atan2 becomes noisy
+            # at close range and causes the rover to veer before waypoint arrival.
+            if distance > self.goal_tolerance * 1.5:
+                angular = self.heading_pid.compute(heading_error, dt)
+                if abs(heading_error) > 0.15 and abs(angular) > 0.01:
+                    angular = math.copysign(max(abs(angular), self.min_angular_vel * 0.5), angular)
+                cmd.angular.z = angular
+            else:
+                cmd.angular.z = 0.0
 
         self.cmd_pub.publish(cmd)
 
@@ -387,7 +390,7 @@ class WaypointFollower(Node):
             dy = wp['y'] - self.current_y
             dist = math.sqrt(dx * dx + dy * dy)
             target_heading = math.atan2(dy, dx)
-            heading_err = self._normalize_angle(self.current_yaw - target_heading)
+            heading_err = self._normalize_angle(target_heading - self.current_yaw)
 
             self.get_logger().info(
                 f'WP {self.current_wp_idx + 1}/{len(self.waypoints)}: '

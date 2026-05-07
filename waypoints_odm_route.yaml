@@ -1,0 +1,8 @@
+frame_id: odom
+waypoints:
+- x: 2.1293
+  y: 0.2049
+  yaw: 0.122
+- x: 0.2216
+  y: 0.3541
+  yaw: 3.1415

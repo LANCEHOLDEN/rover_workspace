@@ -1,0 +1,226 @@
+====================================================================
+  waypoint_follower.py — How to Use (Complete Guide)
+====================================================================
+
+WHAT IT DOES
+------------
+waypoint_follower.py is the main PID-based waypoint navigation node.
+It reads a list of (x, y) waypoints from a YAML file, subscribes to
+/odometry/wheels for position feedback, and publishes velocity commands
+to /cmd_vel to drive the rover through each waypoint in sequence.
+
+Unlike bang_waypoint_follower (which uses fixed on/off speeds), this
+node uses PID controllers for smooth heading correction and speed
+scaling.  It also includes stuck detection, hysteresis to prevent
+jitter, and a braking phase between turns.
+
+
+PREREQUISITES
+--------------
+Before running, make sure the following are running and publishing:
+
+  1. Rover drive stack (roverrobotics_ros2) — subscribes to /cmd_vel
+  2. Wheel odometry publisher — publishes to /odometry/wheels
+     (nav_msgs/msg/Odometry with position and quaternion orientation)
+  3. The workspace is built and sourced:
+
+       cd ~/rover_workspace
+       colcon build --symlink-install
+       source install/setup.bash
+
+
+STEP 1: CREATE A WAYPOINT FILE
+--------------------------------
+Waypoints are relative displacements in metres from wherever the
+rover is sitting when the node starts.  Create a YAML file like this:
+
+  frame_id: odom
+  waypoints:
+    - x: 3.0
+      y: 0.0
+    - x: 3.0
+      y: 3.0
+    - x: 0.0
+      y: 0.0
+
+  - Positive x = forward from start heading
+  - Positive y = left from start heading
+  - Negative values = backward / right respectively
+  - z and yaw fields are accepted in the file but are ignored
+
+Save the file somewhere accessible, e.g.:
+  ~/rover_workspace/my_waypoints.yaml
+
+
+STEP 2A: RUN WITH ros2 run (SIMPLE, DIRECT)
+---------------------------------------------
+Basic run with defaults:
+
+  ros2 run waypoint_reader waypoint_follower \
+      --ros-args -p waypoint_file:=/home/lanceholden/rover_workspace/my_waypoints.yaml
+
+With custom speed and tolerance:
+
+  ros2 run waypoint_reader waypoint_follower \
+      --ros-args \
+      -p waypoint_file:=/home/lanceholden/rover_workspace/my_waypoints.yaml \
+      -p max_linear_vel:=0.4 \
+      -p max_angular_vel:=1.5 \
+      -p goal_tolerance:=0.3
+
+Run in a loop (rover repeats the route continuously):
+
+  ros2 run waypoint_reader waypoint_follower \
+      --ros-args \
+      -p waypoint_file:=/home/lanceholden/rover_workspace/my_waypoints.yaml \
+      -p loop:=true
+
+Run waypoints in reverse order:
+
+  ros2 run waypoint_reader waypoint_follower \
+      --ros-args \
+      -p waypoint_file:=/home/lanceholden/rover_workspace/my_waypoints.yaml \
+      -p reverse:=true
+
+
+STEP 2B: RUN WITH THE LAUNCH FILE
+------------------------------------
+The launch file at:
+  src/waypoint_reader/launch/waypoint_follower.launch.py
+
+provides the same arguments as named launch arguments:
+
+  ros2 launch waypoint_reader waypoint_follower.launch.py \
+      waypoint_file:=/home/lanceholden/rover_workspace/my_waypoints.yaml \
+      max_linear_vel:=0.5 \
+      goal_tolerance:=0.5 \
+      loop:=false \
+      reverse:=false
+
+
+ALL AVAILABLE PARAMETERS
+--------------------------
+Parameter                  Default   Description
+---------                  -------   -----------
+waypoint_file              waypoints.yaml   Path to YAML waypoint file
+goal_tolerance             0.3       metres — how close = "arrived"
+max_linear_vel             0.3       m/s maximum forward speed
+max_angular_vel            2.2       rad/s maximum turn speed
+heading_threshold          0.175     rad (~10°) — heading error to enter turn mode
+loop                       false     repeat route indefinitely
+reverse                    false     run waypoints in reverse order
+stuck_timeout              15.0      seconds before stuck detection kills node
+stuck_distance_threshold   0.05      metres — minimum movement to reset stuck timer
+min_angular_vel            1.5       rad/s floor on turn commands (overcomes stiction)
+min_linear_vel             0.2       m/s floor on drive commands (prevents crawl)
+yaw_smooth_alpha           0.14      EMA weight for yaw smoothing (0=frozen, 1=raw)
+heading_error_smooth_alpha 0.20      EMA weight for heading error smoothing
+heading_kp / ki / kd       1.2/0.02/0.6   PID gains for heading control
+distance_kp / ki / kd      0.5/0.0/0.05   PID gains for distance/speed control
+
+
+WHAT HAPPENS WHEN YOU RUN IT
+------------------------------
+1. Node starts, loads waypoints from the YAML file.
+2. Node waits for the first /odometry/wheels message.
+3. On first message, the current position is set as the origin (0,0),
+   and the current heading is recorded.  All waypoints are rotated by
+   the initial heading so the first waypoint is "x metres in front of
+   the rover's nose" regardless of which direction it faces globally.
+4. Navigation begins immediately.
+5. For each waypoint the node cycles through:
+     a. BRAKING  — publishes zero velocity for 0.5 s (10 cycles at 20 Hz)
+                   to ensure the rover has stopped before turning.
+     b. TURNING  — PID rotates the rover toward the waypoint heading.
+                   Exits only when heading error < 40% of threshold
+                   (hysteresis prevents jitter).
+     c. DRIVING  — PID drives forward.  Heading correction is applied
+                   during driving if error stays small.  Angular correction
+                   is suppressed in the final approach (< 1.5× tolerance)
+                   to prevent veering.
+6. On arrival (distance < goal_tolerance), PIDs reset, stuck timer
+   resets, braking phase begins for the next waypoint.
+7. If loop=False (default), the rover stops after the last waypoint.
+8. If loop=True, the rover returns to waypoint 1 and repeats.
+
+
+STUCK DETECTION
+----------------
+If the rover moves less than stuck_distance_threshold (0.05 m) for
+more than stuck_timeout (15 s), the node logs an ERROR, publishes zero
+velocity, and shuts down navigation.  This prevents burning out motors
+if the rover is physically blocked.
+
+To change the timeout:
+  -p stuck_timeout:=30.0
+
+
+MONITORING PROGRESS
+--------------------
+The node logs status at 1 Hz.  Watch it with:
+
+  ros2 run waypoint_reader waypoint_follower ...
+  # (output goes to screen)
+
+Or in another terminal:
+  ros2 topic echo /cmd_vel          # see velocity commands in real time
+  ros2 topic echo /odometry/wheels  # see position feedback
+
+Each status line looks like:
+  WP 2/4: dist=1.43m, heading_err=-5.2 deg | pos=(1.23, 0.45), yaw=12.3 deg | target=(3.00, 0.00)
+
+
+STOPPING THE NODE
+------------------
+Press Ctrl-C in the terminal.  The node's finally block will publish
+a zero Twist (stop all motion) before shutting down.
+
+
+TUNING TIPS
+-----------
+Problem: rover oscillates / weaves while driving
+  → Reduce heading_kp (try 0.8) or increase heading_kd (try 0.8)
+  → Reduce heading_error_smooth_alpha (try 0.10) to slow the error response
+
+Problem: rover overshoots waypoints
+  → Reduce goal_tolerance (try 0.2) — but only if odometry is accurate
+  → Reduce max_linear_vel so the rover slows down earlier
+
+Problem: rover won't turn — sticks in place
+  → Increase min_angular_vel (try 2.0) to overcome motor stiction
+
+Problem: rover drifts off course over long distances
+  → Wheel odometry accumulates drift — this is expected
+  → For routes > ~10 m, switch to a GPS-anchored or fused odometry source
+    if one is available on /odometry/global or /ins
+
+Problem: rover seems to not reach waypoints / always overshoots
+  → Increase goal_tolerance (try 0.5 or 1.0)
+  → Check that waypoints are in the correct relative coordinate frame
+
+
+COMPARING TO bang_waypoint_follower
+-------------------------------------
+Feature                    waypoint_follower    bang_waypoint_follower
+-------                    -----------------    ----------------------
+Speed control              PID (gradual)        Fixed on/off
+Heading correction         PID (continuous)     Bang-bang (on/off)
+Heading correction in drive  Yes (with limits)  No (re-aligns only when drifted)
+Stuck detection            Yes                  No
+Braking phase              Yes (0.5s explicit)  Stop then turn immediately
+Odom source                /odometry/wheels     Selectable (local/global/wheels/ins)
+Coordinate frame rotation  Yes (rotates by      No (offset only)
+                           initial heading)
+Smoothing (EMA)            Yes (yaw + error)    No
+
+Use waypoint_follower when you need:
+  - Smooth, controlled motion
+  - Better straight-line tracking
+  - Stuck detection as a safety feature
+
+Use bang_waypoint_follower when you need:
+  - Simplicity / easy to debug
+  - Consistent angular speed during turns
+  - A different odometry source (local EKF, INS)
+
+====================================================================

@@ -1,0 +1,213 @@
+====================================================================
+  bang_waypoint_follower.py — How to Use (Complete Guide)
+====================================================================
+
+WHAT IT DOES
+------------
+bang_waypoint_follower.py navigates the rover through a sequence of
+(x, y) waypoints using simple bang-bang (fixed on/off) control.
+It spins at a fixed angular speed to align with each waypoint, then
+drives straight at a fixed linear speed until it arrives.  No PID,
+no gradual speed scaling — just clean, predictable fixed-speed motion.
+
+
+PREREQUISITES
+--------------
+Before running, make sure the following are active:
+
+  1. Rover drive stack (roverrobotics_ros2) — listens to /cmd_vel
+  2. At least one odometry source publishing nav_msgs/msg/Odometry
+     (see odom_source parameter below for which topic to use)
+  3. Workspace is built and sourced:
+
+       cd ~/rover_workspace
+       colcon build --symlink-install
+       source install/setup.bash
+
+
+STEP 1: CREATE A WAYPOINT FILE
+--------------------------------
+Waypoints are x/y offsets in metres from wherever the rover is sitting
+when the node starts.  Create a YAML file like this:
+
+  frame_id: odom
+  waypoints:
+    - x: 3.0
+      y: 0.0
+    - x: 3.0
+      y: 3.0
+    - x: 0.0
+      y: 0.0
+
+  - Positive x = forward from start position
+  - Positive y = left from start position
+  - Negative values = backward / right
+  - z and yaw fields are accepted but ignored
+
+Save it somewhere accessible, e.g.:
+  ~/rover_workspace/my_waypoints.yaml
+
+IMPORTANT: The coordinate frame is purely offset-based — the rover
+does NOT rotate waypoints by its initial heading (unlike waypoint_follower).
+This means x/y in the YAML map directly onto the odometry frame axes.
+If /odometry/wheels defines x as "east" and y as "north", then your
+waypoints are in that same east/north frame, not "forward/left of rover."
+To record waypoints in the actual robot frame, drive the route manually
+and use log_waypoints_odom.py to capture positions.
+
+
+STEP 2A: RUN WITH ros2 run (SIMPLE, DIRECT)
+---------------------------------------------
+Minimal run using defaults:
+
+  ros2 run waypoint_reader bang_waypoint_follower \
+      --ros-args -p waypoint_file:=/home/lanceholden/rover_workspace/my_waypoints.yaml
+
+With a specific odometry source (recommended):
+
+  ros2 run waypoint_reader bang_waypoint_follower \
+      --ros-args \
+      -p waypoint_file:=/home/lanceholden/rover_workspace/my_waypoints.yaml \
+      -p odom_source:=local
+
+With custom speed and tolerances:
+
+  ros2 run waypoint_reader bang_waypoint_follower \
+      --ros-args \
+      -p waypoint_file:=/home/lanceholden/rover_workspace/my_waypoints.yaml \
+      -p odom_source:=local \
+      -p linear_speed:=0.4 \
+      -p angular_speed:=0.8 \
+      -p goal_tolerance:=0.2 \
+      -p heading_tolerance:=0.10
+
+Run in a loop (rover repeats the route continuously):
+
+  ros2 run waypoint_reader bang_waypoint_follower \
+      --ros-args \
+      -p waypoint_file:=/home/lanceholden/rover_workspace/my_waypoints.yaml \
+      -p loop:=true
+
+
+ALL AVAILABLE PARAMETERS
+--------------------------
+Parameter           Default    Description
+---------           -------    -----------
+waypoint_file       waypoints.yaml   Path to YAML waypoint file
+linear_speed        0.5        m/s — fixed forward drive speed
+angular_speed       1.0        rad/s — fixed spin speed during turns
+goal_tolerance      0.1        metres — how close = "arrived" at waypoint
+heading_tolerance   0.15       rad (~9°) — max heading error to start/keep driving
+loop                false      repeat route indefinitely after last waypoint
+odom_source         wheels     which odometry topic to use (see below)
+
+ODOM SOURCE OPTIONS:
+  'local'   → /odometry/local   EKF fusing wheel encoders + IMU  [RECOMMENDED]
+  'global'  → /odometry/global  EKF fusing local + GPS — GPS-anchored, can jump
+  'wheels'  → /odometry/wheels  Raw wheel encoders only — drifts over distance
+  'ins'     → /ins              InertialSense firmware EKF (NED frame)
+
+
+WHAT HAPPENS WHEN YOU RUN IT
+------------------------------
+1. Node loads waypoints from the YAML file and logs how many it found.
+2. Node waits for the first odometry message on the selected topic.
+3. On first message, the current position is saved as the origin (0, 0).
+   All subsequent positions are measured as offsets from this origin.
+   The initial yaw is also logged (for reference only — waypoints are
+   NOT rotated by it).
+4. Navigation begins immediately with state = TURN.
+
+For each waypoint, the sequence is:
+
+  TURN  → The rover spins at ±angular_speed rad/s toward the waypoint
+           heading.  The sign (left or right) is chosen automatically
+           to take the shortest path.  Spinning continues until
+           |heading_error| < heading_tolerance (~9°).
+
+  DRIVE → The rover drives straight at linear_speed m/s.
+           If the rover drifts and heading error grows back above
+           heading_tolerance, it stops and re-enters TURN to re-align
+           before continuing.
+           When distance to waypoint < goal_tolerance, the rover stops,
+           advances to the next waypoint, and re-enters TURN.
+
+5. After the last waypoint:
+     - loop=false (default): rover stops, node deactivates.
+     - loop=true: rover returns to waypoint 1 and continues.
+
+
+MONITORING PROGRESS
+--------------------
+Status is logged to the terminal at 1 Hz.  Each line looks like:
+
+  [TURN] WP 2/4 | dist=2.14m | heading_err=34.5° | pos=(1.00, 0.00) | yaw=12.3°
+  [DRIVE] WP 2/4 | dist=1.87m | heading_err=1.2° | pos=(1.13, 0.00) | yaw=47.1°
+
+Watch velocity commands in real time in another terminal:
+  ros2 topic echo /cmd_vel
+
+Watch position feedback:
+  ros2 topic echo /odometry/wheels   # (or whichever source you chose)
+
+
+STOPPING THE NODE
+------------------
+Press Ctrl-C.  The finally block publishes a zero Twist (stops all
+motion) before shutting down cleanly.
+
+
+TUNING TIPS
+-----------
+Problem: rover overshoots the waypoint heading during turns
+  → Reduce angular_speed (try 0.5–0.6 rad/s)
+  → Reduce heading_tolerance slightly so it cuts off earlier
+
+Problem: rover won't drive — keeps re-aligning in TURN
+  → Increase heading_tolerance (try 0.20–0.25 rad) so it is easier
+    to satisfy the alignment condition
+  → Check that /odometry/wheels (or chosen source) is publishing stable yaw
+
+Problem: rover stops short of waypoints
+  → Increase goal_tolerance (try 0.3–0.5 m)
+
+Problem: rover keeps re-aligning mid-drive (drifting)
+  → Increase heading_tolerance slightly so minor drift doesn't trigger
+    a re-align on every straight leg
+  → Switch to odom_source:=local for better heading stability
+
+Problem: position drifts over long routes
+  → Use odom_source:=local (EKF-fused, much more stable than raw wheels)
+  → Avoid odom_source:=wheels for routes longer than ~10 m
+
+Problem: rover turns the wrong way
+  → This should not happen — the node automatically picks the shortest
+    turn direction.  If it does, check for a yaw discontinuity in the
+    odometry source (e.g. NED frame from /ins wrapping differently).
+
+
+COMPARING TO waypoint_follower
+--------------------------------
+Feature                    bang_waypoint_follower    waypoint_follower
+-------                    ----------------------    -----------------
+Speed control              Fixed on/off              PID (gradual)
+Heading correction         Bang-bang (on/off)        PID (continuous)
+Heading correction in drive  No (re-aligns on drift) Yes (while driving)
+Stuck detection            No                        Yes (15s timeout)
+Braking phase              No (stop then turn)       Yes (0.5s explicit zeros)
+Odom source                Selectable (4 options)    /odometry/wheels only
+Coordinate frame rotation  No (offset only)          Yes (rotates by initial heading)
+Smoothing (EMA)            No                        Yes (yaw + heading error)
+Complexity                 Simple, easy to debug     More sophisticated
+
+Use bang_waypoint_follower when you want:
+  - Simple, predictable behaviour that is easy to reason about
+  - Consistent spin speed during turns (good for flat, open areas)
+  - Flexibility to choose a different odometry source (local, INS, etc.)
+
+Use waypoint_follower when you want:
+  - Smoother motion and better straight-line tracking
+  - Continuous heading correction while driving
+  - Built-in stuck detection as a safety net
+
+====================================================================

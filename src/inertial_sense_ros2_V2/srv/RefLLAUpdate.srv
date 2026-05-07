@@ -1,0 +1,4 @@
+# Reference LLA update service
+float64[3] lla
+---
+bool success

@@ -1,0 +1,184 @@
+====================================================================
+  bang_waypoint_follower.py — Detailed Technical Summary
+====================================================================
+
+OVERVIEW
+--------
+bang_waypoint_follower.py is a ROS 2 node that navigates the rover
+through a sequence of (x, y) waypoints using simple bang-bang (on/off)
+control — no PID, just fixed-speed commands. The approach is borrowed
+directly from spin_360.py (pure rotation) and move_5_feet.py (pure
+forward motion), combined into a two-phase state machine.
+
+The node lives in the `waypoint_reader` package and is registered as
+the `bang_waypoint_follower` entry point in setup.py.
+
+
+HOW IT WORKS — THE STATE MACHINE
+----------------------------------
+The rover is always in one of two states:
+
+  TURN  → spin in place at a fixed angular speed until the rover is
+           pointing at the next waypoint (within heading_tolerance).
+
+  DRIVE → drive straight at a fixed linear speed until the rover is
+           within goal_tolerance metres of the waypoint.
+
+On startup the state is always TURN.  When the rover aligns its
+heading, it transitions to DRIVE.  When it arrives at the waypoint, it
+stops, advances to the next waypoint index, and transitions back to
+TURN.  This repeats until all waypoints are consumed.
+
+There is one additional safety check during DRIVE: if the heading
+drifts back outside heading_tolerance (e.g. the rover curved), the
+node immediately stops and re-enters TURN to re-align before driving
+again.
+
+
+COORDINATE FRAME — ORIGIN RELATIVE
+-------------------------------------
+On the very first odometry message received the node records the
+rover's raw position as the "origin".  All subsequent positions and
+all waypoint coordinates are treated as offsets from that origin.
+
+  self.x = raw_x - origin_x
+  self.y = raw_y - origin_y
+
+This means waypoints in the YAML file are relative displacements from
+wherever the rover was sitting when the node started — NOT absolute
+world coordinates.  If you restart the node without moving the rover,
+the same waypoint file will reproduce the same physical path.
+
+
+ODOMETRY SOURCE
+---------------
+The node accepts a parameter `odom_source` that selects which topic
+provides position and heading feedback:
+
+  'local'   → /odometry/local   (EKF fusing wheel encoders + IMU)
+                                  RECOMMENDED — smooth and drift-stable
+  'global'  → /odometry/global  (EKF fusing local + GPS) — GPS-anchored
+                                  but can jump when GPS updates
+  'wheels'  → /odometry/wheels  (raw wheel encoders only) — fast but
+                                  accumulates drift over distance
+  'ins'     → /ins              (InertialSense firmware EKF, NED frame)
+                                  Only use if other sources unavailable
+
+Default is 'wheels' (set in code), but the docstring recommends 'local'.
+
+
+PARAMETERS (all tunable at runtime)
+--------------------------------------
+  waypoint_file      Path to the YAML file containing waypoints.
+                     Default: 'waypoints.yaml'
+
+  linear_speed       How fast to drive straight, in m/s.
+                     Default: 0.5 m/s
+
+  angular_speed      How fast to spin during turns, in rad/s.
+                     Default: 1.0 rad/s  (same as spin_360.py)
+
+  goal_tolerance     How close the rover must get to a waypoint
+                     before it is considered "reached", in metres.
+                     Default: 0.1 m
+
+  heading_tolerance  Maximum allowed heading error before the rover
+                     stops driving and re-aligns, in radians.
+                     Default: 0.15 rad (~9 degrees)
+
+  loop               If True, the rover loops back to waypoint 1
+                     after finishing the last waypoint.
+                     Default: False
+
+  odom_source        Which odometry topic to subscribe to.
+                     Default: 'wheels'  (see above)
+
+
+CONTROL LOOP DETAILS (20 Hz)
+------------------------------
+Every 50 ms the _control_loop() method fires:
+
+  1. If no odometry has arrived yet, or no waypoints are loaded, skip.
+
+  2. If all waypoints are done:
+       - If loop=True  → reset index to 0, keep running.
+       - If loop=False → stop all motion, deactivate.
+
+  3. Compute dx, dy to the current target waypoint.
+     Compute Euclidean distance.
+
+  4. TURN state:
+       a. Compute desired_yaw = atan2(dy, dx)
+       b. Compute heading_error = angle_diff(desired_yaw, current_yaw)
+       c. If |heading_error| < heading_tolerance → transition to DRIVE.
+       d. Otherwise → publish angular.z = ±angular_speed (sign follows
+          the direction of the shortest turn).
+
+  5. DRIVE state:
+       a. If distance < goal_tolerance → log arrival, advance wp_idx,
+          transition back to TURN.
+       b. Recompute heading_error.  If it drifted > heading_tolerance
+          → stop, transition back to TURN to re-align.
+       c. Otherwise → publish linear.x = linear_speed.
+
+The Twist message is zero-initialised so any unpopulated field
+(e.g. linear.y, angular.x) is automatically 0.
+
+
+WAYPOINT FILE FORMAT
+----------------------
+The YAML file must have this structure:
+
+  frame_id: odom
+  waypoints:
+    - x: 1.0
+      y: 0.0
+    - x: 1.0
+      y: 2.0
+    - x: 0.0
+      y: 0.0
+
+  - x and y are in metres, relative to the rover's start position.
+  - z and yaw fields are accepted but ignored by this node.
+  - frame_id is read but not used for coordinate math.
+
+
+LOGGING
+---------
+A 1 Hz status timer (_log_status) prints:
+  [STATE] WP n/total | dist=Xm | heading_err=Y° | pos=(x,y) | yaw=Z°
+
+The node also logs whenever:
+  - Origin is set (first odom message)
+  - Heading aligns and DRIVE begins
+  - Heading drifts and re-alignment is triggered
+  - A waypoint is reached
+  - All waypoints are complete
+
+
+STOPPING BEHAVIOUR
+-------------------
+_stop() publishes a zero Twist (all fields 0.0).  This is called:
+  - When a waypoint is reached (before transitioning state)
+  - When heading drift triggers re-alignment
+  - On KeyboardInterrupt (Ctrl-C) in the finally block of main()
+  - After the last waypoint when loop=False
+
+
+KNOWN LIMITATIONS
+------------------
+1. Bang-bang turning does not slow down as it approaches the target
+   heading — it cuts off abruptly at tolerance.  This can cause a
+   small heading overshoot, especially at high angular_speed.
+
+2. No forward heading correction during DRIVE.  If the rover veers,
+   it won't correct until the error grows past heading_tolerance.
+
+3. Waypoints are purely 2D (x, y).  Elevation (z) and yaw fields in
+   the YAML are loaded but not used.
+
+4. With odom_source='wheels', accumulated encoder drift will cause
+   the rover's perceived position to diverge from its true position
+   over long distances.  Use 'local' for anything > ~10 m.
+
+====================================================================

@@ -1,0 +1,391 @@
+================================================================================
+  WAYPOINT FOLLOWER — LINE BY LINE EXPLANATION
+  File: src/waypoint_reader/waypoint_reader/waypoint_follower.py
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IMPORTS (lines 1–14)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  rclpy             — ROS 2 Python client library. Lets this script talk to ROS.
+  Node              — Base class for all ROS 2 nodes. Gives us publishers,
+                      subscribers, timers, parameters, and logging.
+  Odometry          — ROS message type from nav_msgs. Contains position (x,y,z)
+                      and orientation (quaternion) + velocities. The EKF
+                      publishes /odometry/filtered in this format.
+  Twist             — ROS message type from geometry_msgs. Contains linear and
+                      angular velocity. We publish this to /cmd_vel to drive
+                      the rover.
+  math              — Python standard library for sin, cos, atan2, sqrt, etc.
+  yaml              — Reads the .yaml waypoint file from disk.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PIDController CLASS (lines 16–45)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  A reusable PID controller used twice: once for heading and once for distance.
+
+  __init__(kp, ki, kd, min_out, max_out)
+    kp          — Proportional gain. Reacts directly to current error.
+                  Bigger = faster response but can overshoot.
+    ki          — Integral gain. Accumulates error over time to eliminate
+                  steady-state offset. Bigger = corrects drift but can windup.
+    kd          — Derivative gain. Reacts to how fast the error is changing.
+                  Bigger = dampens oscillation and overshooting.
+    min_out     — Floor on the output (e.g. -2.2 rad/s for angular).
+    max_out     — Ceiling on the output (e.g. +2.2 rad/s for angular).
+    integral    — Running sum of error × time. Starts at 0.
+    prev_error  — Last cycle's error, used to compute the derivative.
+
+  compute(error, dt)
+    dt          — Time since last call in seconds. Prevents division by zero.
+    integral    — Updated each cycle: integral += error * dt
+    Anti-windup — The integral is clamped so it can never grow large enough
+                  to saturate the output on its own. Prevents the rover from
+                  "winding up" a huge turn command after a long pause.
+    derivative  — (error - prev_error) / dt. How quickly the error is changing.
+    output      — kp*error + ki*integral + kd*derivative, then clamped to
+                  [min_out, max_out].
+
+  reset()
+    Clears the integral and prev_error to zero. Called every time a new
+    waypoint begins so accumulated state from the previous waypoint doesn't
+    carry over.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WaypointFollower.__init__ (lines 49–162)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  super().__init__('waypoint_follower')
+    Registers this node with ROS 2 under the name 'waypoint_follower'.
+
+  --- PARAMETERS (lines 53–73) ---
+
+  waypoint_file       Path to the .yaml file containing the list of waypoints.
+                      Default: 'waypoints.yaml'.
+
+  goal_tolerance      How close (in meters) the rover must get to a waypoint
+                      before it counts as "reached". Default: 0.3 m.
+
+  max_linear_vel      Top forward speed in m/s. Default: 0.3 m/s.
+
+  max_angular_vel     Top turning speed in rad/s. Default: 2.2 rad/s.
+
+  heading_threshold   If the heading error exceeds this angle (in radians),
+                      the rover stops and turns in place before driving.
+                      Default: 0.175 rad (~10 degrees).
+
+  loop                If True, after reaching the last waypoint the rover
+                      starts again from waypoint 1. Default: False.
+
+  reverse             If True, the waypoint list is reversed before starting.
+                      Used to drive a route backwards. Default: False.
+
+  stuck_timeout       If the rover hasn't moved more than stuck_distance_threshold
+                      meters in this many seconds, it declares itself stuck and
+                      stops to avoid burning out the motors. Default: 15 s.
+
+  stuck_distance_threshold
+                      Minimum movement in meters that counts as "making progress"
+                      for the stuck detector. Default: 0.05 m.
+
+  min_angular_vel     Minimum angular command sent when turning. Exists because
+                      the rover's motors have stiction — small commands do nothing.
+                      Any turn command below this floor is boosted up to this value.
+                      Default: 1.5 rad/s.
+
+  min_linear_vel      Minimum forward speed while driving. Prevents the rover
+                      from tapering down to a near-stop far from the waypoint.
+                      Default: 0.2 m/s.
+
+  yaw_smooth_alpha    Exponential moving average (EMA) factor for the yaw reading.
+                      0.0 = completely frozen (ignores new data).
+                      1.0 = raw unfiltered yaw.
+                      0.14 = heavily smoothed — reduces GPS/IMU jitter in heading.
+
+  heading_error_smooth_alpha
+                      EMA factor for the heading error signal fed into the PID.
+                      0.20 = moderately smoothed. Prevents one noisy yaw sample
+                      from causing a sudden large angular command.
+
+  --- PID GAINS (lines 68–73) ---
+
+  heading_kp=1.2   — Large proportional: reacts strongly to heading error.
+  heading_ki=0.02  — Small integral: slowly corrects any persistent bias.
+  heading_kd=0.6   — Large derivative: strongly dampens oscillation.
+  distance_kp=0.5  — Moderate proportional: speeds up as rover gets farther away.
+  distance_ki=0.0  — No integral on distance (not needed).
+  distance_kd=0.05 — Small derivative on distance.
+
+  --- PID SETUP (lines 90–103) ---
+
+  heading_pid     — Controls angular.z (turning). Output range: [-2.2, +2.2] rad/s.
+  distance_pid    — Controls linear.x (forward speed). Output range: [0.0, 0.3] m/s.
+                    Min is 0 because the rover should never drive backwards toward
+                    a waypoint.
+
+  --- STATE VARIABLES (lines 113–143) ---
+
+  current_wp_idx  — Index of the waypoint the rover is currently heading toward.
+                    Starts at 0 (first waypoint).
+
+  current_x/y     — Rover position in the local ENU frame, relative to the
+                    starting position. Updated each time odometry arrives.
+
+  current_yaw     — Rover heading in radians (ENU: 0=East, CCW=positive).
+                    This is the smoothed yaw.
+
+  odom_received   — Flag that becomes True once the first odometry message
+                    arrives. The control loop does nothing until this is True.
+
+  ins_origin      — The (x, y) position from the first odometry message.
+                    All subsequent positions are measured relative to this,
+                    so the rover starts at (0, 0) in its local frame.
+
+  ins_origin_yaw  — The heading from the first odometry message. Waypoints are
+                    rotated by this angle so that waypoint directions are correct
+                    regardless of which direction the rover is pointing at startup.
+
+  smooth_yaw      — The EMA-filtered yaw value. Updated in _odom_callback.
+
+  smooth_heading_error
+                  — The EMA-filtered heading error. Updated in _control_loop.
+
+  turning         — Boolean: True = rover is in turn-in-place mode.
+                    False = rover is driving forward (with minor heading corrections).
+
+  braking         — Boolean: True = currently publishing zero velocity to stop
+                    the rover before starting a turn.
+
+  brake_cycles_remaining
+                  — Countdown of how many more 20 Hz cycles to publish zeros.
+                    Starts at BRAKE_CYCLES (10) each time braking begins.
+
+  BRAKE_CYCLES=10 — 10 cycles × 0.05 s = 0.5 seconds of braking.
+
+  --- PUBLISHERS / SUBSCRIBERS / TIMERS (lines 146–154) ---
+
+  cmd_pub         — Publishes geometry_msgs/Twist to /cmd_vel. This is how the
+                    rover actually moves.
+
+  odom_sub        — Subscribes to /odometry/filtered (nav_msgs/Odometry).
+                    Every message calls _odom_callback to update the rover's
+                    known position and heading.
+
+  control_timer   — Calls _control_loop every 0.05 seconds (20 Hz). This is
+                    the main brain of the node.
+
+  log_timer       — Calls _log_status every 1.0 second to print progress to
+                    the terminal.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_load_waypoints (lines 164–177)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Opens the YAML file and reads the list under the 'waypoints' key.
+  Each waypoint is a dict with at minimum 'x' and 'y' fields (meters).
+  Returns an empty list if the file is missing or malformed (logs an error).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_quaternion_to_yaw (lines 179–183)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Converts a 3D orientation quaternion (x, y, z, w) to a 2D yaw angle.
+  The formula extracts only the rotation around the vertical (z) axis.
+  Result is in radians. In ENU: 0 = facing East, π/2 = facing North.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_normalize_angle (lines 185–191)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Wraps an angle into the range [-π, +π].
+  Critical for heading error: without this, an error of 350° would be treated
+  as a huge right turn instead of a tiny 10° left turn.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_odom_callback (lines 193–236)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Called every time a new /odometry/filtered message arrives (~15–50 Hz).
+
+  FIRST CALL ONLY — Origin Initialization (lines 198–218):
+    The very first odometry message sets the local coordinate origin.
+
+    ins_origin      — Stores the raw (x, y) from the EKF. From now on, the rover's
+                      position will always be measured relative to this point,
+                      so it starts at (0, 0).
+
+    ins_origin_yaw  — Stores the rover's heading at startup.
+
+    Waypoint rotation (lines 207–212):
+      Waypoints in the YAML file are written relative to the rover's starting
+      heading (e.g. "3 meters straight ahead" = waypoint x=3, y=0).
+      If the rover starts facing a different direction, those waypoints would
+      be wrong. So all waypoints are rotated by ins_origin_yaw to align them
+      with the actual starting heading in the world frame.
+      Formula:
+        new_x = old_x * cos(yaw) - old_y * sin(yaw)
+        new_y = old_x * sin(yaw) + old_y * cos(yaw)
+
+  EVERY CALL — Position Update (lines 220–221):
+    current_x = raw_x - origin_x   (offset so rover starts at 0,0)
+    current_y = raw_y - origin_y
+
+  EVERY CALL — Yaw Update (lines 223–236):
+    Extract raw yaw from the quaternion, then apply EMA smoothing:
+      diff = shortest angular distance between new yaw and current smooth yaw
+      smooth_yaw += alpha * diff
+    The result is stored as current_yaw.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_control_loop (lines 238–376)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  The main brain. Runs 20 times per second. Decides what velocity command to send.
+
+  GUARD CHECKS (line 240):
+    Does nothing if: node is inactive, no waypoints loaded, or no odometry yet.
+
+  ALL WAYPOINTS DONE CHECK (lines 244–258):
+    If current_wp_idx has gone past the last waypoint:
+      - If loop=True: reset index to 0 and start over.
+      - If loop=False: stop the rover and set active=False.
+
+  COMPUTE ERRORS (lines 261–284):
+    wp            — The current target waypoint dict.
+    dx, dy        — Distance from rover to waypoint in x and y.
+    distance      — Straight-line distance to waypoint (Pythagorean theorem).
+    target_heading — The angle from the rover TO the waypoint, in radians.
+                     atan2(dy, dx) gives the ENU angle: 0=East, π/2=North.
+    raw_heading_error — target_heading - current_yaw.
+                     Positive = rover needs to turn LEFT (CCW).
+                     Negative = rover needs to turn RIGHT (CW).
+                     Normalized to [-π, +π].
+
+    Heading error smoothing:
+      An EMA is applied to the heading error for fine corrections.
+      But for large turns (error > heading_threshold), the raw unsmoothed
+      error is used so the rover reacts quickly without lag.
+
+  TIME DELTA (lines 287–289):
+    dt = time since last control loop call, in seconds.
+    Used by the PID to compute the integral and derivative correctly.
+
+  WAYPOINT REACHED CHECK (lines 292–308):
+    If distance < goal_tolerance (0.3 m):
+      - Log that the waypoint was reached.
+      - Increment current_wp_idx to point to next waypoint.
+      - Reset both PIDs (clear accumulated integral/derivative).
+      - Reset smooth_heading_error (fresh start for new waypoint).
+      - Set turning=True (rover will turn to face new waypoint before driving).
+      - Start braking (publish zeros for 0.5 s to actually stop the motors).
+      - Reset stuck detector for the next waypoint.
+      - Return early (skip velocity command this cycle).
+
+  STUCK DETECTION (lines 310–330):
+    Every cycle, check how far the rover has moved since last progress reset.
+    If moved >= 0.05 m: reset the stuck timer (we're making progress).
+    If NOT moved >= 0.05 m for stuck_timeout seconds:
+      Log an error, stop the rover, deactivate.
+    This prevents the motors from grinding against an obstacle indefinitely.
+
+  VELOCITY COMMAND GENERATION (lines 332–376):
+
+    cmd = Twist() — Start with zero linear and angular velocity.
+
+    HYSTERESIS (lines 337–342):
+      heading_exit_threshold = heading_threshold * 0.4 = ~0.07 rad (~4 deg)
+      Enter turn-in-place: when |heading_error| > 0.175 rad (10 deg)
+      Exit  turn-in-place: only when |heading_error| < 0.07 rad (4 deg)
+      This gap prevents the rover from rapidly switching between turning and
+      driving when the error is right near the threshold (jitter/oscillation).
+
+    BRAKE-TO-TURN TRANSITION (lines 346–349):
+      When switching from drive mode to turn mode, start braking first.
+      Resets the heading PID so there's no stale derivative from driving.
+
+    BRAKING MODE (lines 351–356):
+      Counts down brake_cycles_remaining each call.
+      Publishes cmd which is all zeros — rover coasts to a stop.
+      After 10 cycles (0.5 s), braking ends and turning begins.
+
+    TURNING MODE (lines 357–364):
+      angular = heading_pid.compute(heading_error, dt)
+        PID output: positive error → positive angular → CCW turn (left).
+      Floor: if |angular| > 0.01, boost it to at least min_angular_vel (1.5).
+        This ensures small PID outputs aren't too small for the motors to act on.
+      linear.x = 0.0 — Pure turn, no forward motion.
+
+    DRIVE MODE (lines 365–374):
+      linear = distance_pid.compute(distance, dt)
+        PID output: farther away = faster forward speed.
+      Floor: speed is at least min_linear_vel (0.2 m/s).
+      angular = heading_pid.compute(heading_error, dt)
+        Continuously corrects heading while driving forward.
+      Reduced angular floor: only half of min_angular_vel (0.75 rad/s) is
+        applied during driving, and only when error > 0.15 rad. Avoids
+        over-correcting tiny heading wobbles during straight-line driving.
+
+    cmd_pub.publish(cmd) — Send the velocity command to the rover motors.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_log_status (lines 378–397)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Runs once per second. Prints a human-readable status line showing:
+    - Which waypoint number out of total.
+    - Distance remaining to current waypoint.
+    - Current heading error in degrees.
+    - Current position (x, y) in meters from origin.
+    - Current yaw in degrees.
+    - Target waypoint coordinates.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_stop_robot (lines 399–403)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Publishes a Twist with all zeros to /cmd_vel.
+  Called on: all waypoints done, stuck detected, or Ctrl-C.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+main (lines 406–421)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  rclpy.init()          — Initializes the ROS 2 Python runtime.
+  WaypointFollower()    — Creates the node (runs __init__, sets everything up).
+  rclpy.spin(node)      — Hands control to ROS. Blocks here, processing callbacks
+                          (timer fires, odom arrives) until interrupted.
+  KeyboardInterrupt     — Ctrl-C triggers this. Stops the rover before exiting.
+  node._stop_robot()    — Safety: always send a stop command on shutdown.
+  node.destroy_node()   — Clean up ROS resources.
+  rclpy.shutdown()      — Shut down the ROS 2 Python runtime.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OVERALL CONTROL FLOW SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1. Startup: Load waypoints from YAML. Wait for first /odometry/filtered.
+  2. First odom: Lock in origin (0,0) and rotate waypoints to match heading.
+  3. Every 50ms (20 Hz):
+       a. Compute distance and heading error to current waypoint.
+       b. If distance < 0.3 m → mark waypoint reached, start braking, advance index.
+       c. If stuck > 15 s without 5 cm progress → stop.
+       d. Decide mode:
+            • Braking:  publish zeros for 0.5 s
+            • Turning:  PID angular only, no forward motion
+            • Driving:  PID forward + PID heading correction
+       e. Publish /cmd_vel.
+  4. Done: stop rover when all waypoints reached (or loop back to step 3).
+
+================================================================================
